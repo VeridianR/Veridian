@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>BuzzFeed – Spoon Quest</title>
+  <style>
+    html, body {
+      margin: 0;
+      background: #000;
+      color: #fff;
+      font-family: sans-serif;
+      user-select: none;
+      overflow: hidden;
+      height: 100%;
+      width: 100%;
+      position: relative;
+    }
+    #ui {
+      position: fixed;
+      top: 8px;
+      left: 8px;
+      font-size: 14px;
+      line-height: 20px;
+      white-space: pre;
+    }
+    canvas {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 12px #000;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" width="960" height="540"></canvas>
+  <div id="ui">Loading assets…</div>
+<script>
+/************************* ASSET LOADING ***********************************/
+const ASSET_MANIFEST = [
+  { key:'bg_far',   src:'bg.png' },
+  { key:'bee',      src:'1.png',       frameW:640,  frameH:1000, frames:2, fps:10 },
+  { key:'spoon',    src:'spoon.png',   frameW:1024, frameH:1024, frames:1, fps:0 },
+  { key:'shield',   src:'shield.png',  frameW:1024, frameH:1024, frames:1, fps:0 },
+  { key:'freeware', src:'freeware.png',frameW:1024, frameH:1024, frames:1, fps:0 },
+  { key:'wifi',     src:'wifi.png',    frameW:1024, frameH:1024, frames:1, fps:0 },
+  { key:'orange',   src:'orange.png',  frameW:1024, frameH:1024, frames:1, fps:0 },
+  { key:'broccoli', src:'broccoli.png',frameW:1024, frameH:1024, frames:1, fps:0 },
+  { key:'pea',      src:'pea.png',     frameW:1024, frameH:1024, frames:1, fps:0 },
+];
+const ASSETS = {};
+function loadAssets(){
+  return Promise.all(ASSET_MANIFEST.map(def=>new Promise(res=>{
+    const img = new Image();
+    img.src = def.src;
+    img.onload  = ()=>{ ASSETS[def.key] = { img, ...def }; res(); };
+    img.onerror = ()=>{ res(); };
+  })));
+}
+
+/************************* ENGINE CONSTANTS *******************************/
+const W = 960, H = 540, FPS = 60;
+const TARGET_SPOONS = 50;
+const SCROLL_BASE = 0.5, SCROLL_PER_SPOON = 0.1, DASH_BONUS = 5;
+const DASH_TIME = 0.3, DASH_CD = 1.8;
+const INVULN_TIME = 0.5, LIVES = 3;
+const BEE_HSPEED = 500, BEE_VSPEED = 500;
+let SPAWN_SPOON = 1, SPAWN_ENEMY = 4, SPAWN_POWER = 6.0;
+const HIT_FLIP_TIME = 0.3;
+
+/************************* HELPERS *****************************************/
+const rand  = (a,b)=>Math.random()*(b-a)+a;
+const randI = (a,b)=>Math.floor(rand(a,b));
+const keys = {};
+addEventListener('keydown', e=> keys[e.key.toLowerCase()] = true);
+addEventListener('keyup',   e=> delete keys[e.key.toLowerCase()]);
+
+/************************* CANVAS & UI *************************************/
+const cvs = document.getElementById('canvas');
+const ctx = cvs.getContext('2d');
+const ui  = document.getElementById('ui');
+
+/************************* SPRITE‑SHEET HELP ******************************/
+class Sheet {
+  constructor(def){ Object.assign(this, def); this.frame=0; this.acc=0; }
+  update(dt){
+    if (!this.frames||!this.fps) return;
+    this.acc += dt*this.fps;
+    if (this.acc>=1){ this.acc%=1; this.frame=(this.frame+1)%this.frames; }
+  }
+  draw(ctx,x,y,w,h){
+    if (!this.img||!this.frames){
+      ctx.fillStyle='hotpink'; ctx.fillRect(x-w/2,y-h/2,w,h);
+      return;
+    }
+    const fx = this.frameW*this.frame;
+    ctx.drawImage(this.img, fx,0,this.frameW,this.frameH, x-w/2,y-h/2,w,h);
+  }
+}
+
+/************************* CORE ENTITIES **********************************/
+class Bee {
+  constructor(){
+    this.x = W*0.2; this.y = H/2;
+    this.w = 64; this.h = 64;
+    this.sheet = new Sheet(ASSETS.bee);
+
+    this.spoons = 0;
+    this.lives  = LIVES;
+    this.score  = 0;
+    this.invuln = 0;
+    this.shield = 0;
+    this.slowed = 0;
+    this.reversed = 0;
+    this.stunned = 0;
+    this.dash = 0;
+    this.dashCd = 0;
+    this.hitFlipTimer = 0;
+  }
+  update(dt){
+    ['invuln','shield','slowed','reversed','stunned','dash','dashCd']
+      .forEach(k=> this[k] = Math.max(0, this[k] - dt));
+    this.hitFlipTimer = Math.max(0, this.hitFlipTimer - dt);
+    this.sheet.update(dt);
+
+    if (this.stunned <= 0) {
+      let dx = (keys['d']||keys['arrowright']?1:0) - (keys['a']||keys['arrowleft']?1:0);
+      let dy = (keys['s']||keys['arrowdown']?1:0) - (keys['w']||keys['arrowup']?1:0);
+      if (this.reversed>0){ dx=-dx; dy=-dy; }
+      const len = Math.hypot(dx,dy)||1; dx/=len; dy/=len;
+      this.x += dx * BEE_HSPEED * dt;
+      this.y += dy * BEE_VSPEED * dt;
+    }
+    this.x = Math.min(W - this.w/2, Math.max(this.w/2, this.x));
+    this.y = Math.min(H - this.h/2, Math.max(this.h/2, this.y));
+
+    if ((keys[' ']||keys['shift']) && this.dashCd<=0 && this.dash<=0) {
+      this.dash = DASH_TIME;
+      this.dashCd = DASH_CD;
+    }
+  }
+  hit(){
+    if (this.invuln>0||this.shield>0) return;
+    this.lives--;
+    this.invuln = INVULN_TIME;
+    if (this.lives>0) this.hitFlipTimer = HIT_FLIP_TIME;
+  }
+  collect(){ this.spoons++; this.score+=10; }
+  grabShield(){ this.shield=4; this.score+=25; }
+  draw(){
+    if (this.lives <= 0) {
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.rotate(Math.PI);
+      this.sheet.draw(ctx,0,0,this.w,this.h);
+      ctx.restore();
+      return;
+    }
+    if (this.hitFlipTimer > 0) {
+      const p = (HIT_FLIP_TIME - this.hitFlipTimer)/HIT_FLIP_TIME;
+      const angle = Math.sin(p*Math.PI)*Math.PI;
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.rotate(angle);
+      this.sheet.draw(ctx,0,0,this.w,this.h);
+      ctx.restore();
+      return;
+    }
+    if (this.shield > 0) {
+      ctx.strokeStyle='cyan'; ctx.lineWidth=3;
+      ctx.beginPath(); ctx.arc(this.x,this.y,this.w*0.7,0,Math.PI*2); ctx.stroke();
+    }
+    this.sheet.draw(ctx,this.x,this.y,this.w,this.h);
+  }
+}
+
+/************************* BITMAP ENTITIES *********************************/
+class Bitmap {
+  constructor(key,r){ this.sheet=new Sheet(ASSETS[key]); this.x=W+40; this.y=randI(60,H-60); this.r=r; }
+  update(scroll){ this.x-=scroll; this.sheet.update(1/FPS); }
+  off(){ return this.x < -60; }
+  draw(){ this.sheet.draw(ctx,this.x,this.y,this.r*2,this.r*2); }
+}
+class Spoon     extends Bitmap{ constructor(){ super('spoon',20);} }
+class ShieldPow extends Bitmap{ constructor(){ super('shield',26);} }
+class Enemy     extends Bitmap{
+  constructor(key,effect,r,speed){ super(key,r); this.effect=effect; this.speed=speed; this.vx=-speed; }
+  update(scroll){ this.x += this.vx - scroll; this.sheet.update(1/FPS); }
+}
+class PeaPod extends Enemy{
+  constructor(){ super('freeware','slow',28,1.5); this.cool=rand(0,1.2); }
+  update(scroll){
+    super.update(scroll);
+    if ((this.cool -= 1/FPS)<=0) {
+      this.cool = 1.2;
+      projectiles.push(new Pea(this.x,this.y));
+    }
+  }
+}
+class Pea extends Enemy{
+  constructor(x,y){
+    super('pea','damage',12,0);
+    this.x=x; this.y=y;
+    const ang=rand(0,Math.PI*2);
+    this.vx=Math.cos(ang)*4; this.vy=Math.sin(ang)*4;
+  }
+  update(scroll){ this.x+=this.vx-scroll; this.y+=this.vy; this.sheet.update(1/FPS); }
+}
+class Broccoli extends Enemy{
+  constructor(){ super('broccoli','stun',32,0); }
+  update(scroll){
+    const dx=bee.x-this.x, dy=bee.y-this.y, d=Math.hypot(dx,dy);
+    if (d<200){ this.vx=dx/d*3; this.vy=dy/d*3; }
+    this.x+=this.vx-scroll; this.y+=this.vy; this.sheet.update(1/FPS);
+  }
+}
+
+/************************* GLOBALS & INIT *********************************/
+let bee, spoons, powers, enemies, projectiles, scroll, state='loading';
+let tS, tE, tP, elapsed;
+let gameStartTime=0, gameEndTime=0, finalTime=0;
+
+loadAssets().then(startGame);
+function startGame(){
+  ui.textContent=''; state='game';
+  gameStartTime = performance.now();
+  bee = new Bee();
+  spoons = [...Array(6)].map(()=>new Spoon());
+  powers = [];
+  enemies = [...Array(5)].map(()=>spawnEnemy());
+  projectiles = [];
+  scroll = SCROLL_BASE;
+  tS = SPAWN_SPOON; tE = SPAWN_ENEMY; tP = SPAWN_POWER; elapsed=0;
+  requestAnimationFrame(loop);
+}
+
+function spawnEnemy(){
+  const t=randI(0,5);
+  switch(t){
+    case 0: return new Enemy('freeware','slow',28,1);
+    case 1: return new Enemy('wifi','reverse',28,1.5);
+    case 2: return new Enemy('orange','damage',28,2);
+    case 3: return new PeaPod();
+    default:return new Broccoli();
+  }
+}
+const collide=(ax,ay,ar,b)=>((ax-b.x)**2+(ay-b.y)**2<(ar+b.r)**2);
+const applyEff=e=>{
+  switch(e.effect){
+    case 'slow':    bee.slowed = 2; break;
+    case 'reverse': bee.reversed =2; break;
+    case 'stun':    bee.stunned =1; break;
+  }
+  bee.hit();
+};
+
+/************************* MAIN LOOP ***************************************/
+let last = performance.now();
+function loop(now){
+  const dt=(now-last)/1000; last=now;
+  if(state==='game') update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/************************* UPDATE ******************************************/
+function update(dt){
+  elapsed+=dt;
+  if(elapsed>20){ elapsed-=20; SPAWN_ENEMY=Math.max(0.4,SPAWN_ENEMY*0.92); SPAWN_SPOON=Math.max(0.8,SPAWN_SPOON*0.96); }
+
+  scroll = SCROLL_BASE + bee.spoons*SCROLL_PER_SPOON + (bee.dash>0?DASH_BONUS:0);
+  if(bee.slowed>0) scroll *= 0.6;
+
+  bee.update(dt);
+
+  tS-=dt; if(tS<=0){ tS+=SPAWN_SPOON; spoons.push(new Spoon()); }
+  tE-=dt; if(tE<=0){ tE+=SPAWN_ENEMY; enemies.push(spawnEnemy()); }
+  tP-=dt; if(tP<=0){ tP+=SPAWN_POWER; powers.push(new ShieldPow()); }
+
+  [...spoons,...powers,...enemies,...projectiles].forEach(o=>o.update(scroll));
+
+  spoons      = spoons.filter(o=>!o.off());
+  powers      = powers.filter(o=>!o.off());
+  enemies     = enemies.filter(o=>!o.off());
+  projectiles = projectiles.filter(o=>!o.off?.()&&o.x>-40);
+
+  spoons = spoons.filter(s=>{ if(collide(bee.x,bee.y,bee.w*0.4,s)){ bee.collect(); return false;} return true; });
+  powers = powers.filter(p=>{ if(collide(bee.x,bee.y,bee.w*0.4,p)){ bee.grabShield(); return false;} return true; });
+  [...enemies,...projectiles].forEach(e=>{ if(collide(bee.x,bee.y,bee.w*0.4,e)&&bee.invuln<=0&&bee.shield<=0){ applyEff(e); } });
+
+  if(bee.spoons>=TARGET_SPOONS){
+    state='win';
+    gameEndTime = performance.now();
+    finalTime   = (gameEndTime - gameStartTime)/1000;
+  }
+  if(bee.lives<=0){
+    state='lose';
+    gameEndTime = performance.now();
+    finalTime   = (gameEndTime - gameStartTime)/1000;
+  }
+}
+
+/************************* DRAW *********************************************/
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  if(ASSETS.bg_far?.img) ctx.drawImage(ASSETS.bg_far.img,0,0,W,H);
+
+  if(state==='game'){
+    ctx.save();
+    ctx.filter='drop-shadow(0 0 2px white)';
+    ctx.fillStyle='rgba(0,0,0,0.4)';
+    ctx.fillRect(0,0,W,H);
+    [...spoons,...powers,...enemies,...projectiles].forEach(o=>o.draw());
+    bee.draw();
+    ctx.restore();
+
+    const elapsedSecs = (performance.now() - gameStartTime)/1000;
+    const m = Math.floor(elapsedSecs/60);
+    const s = String(Math.floor(elapsedSecs%60)).padStart(2,'0');
+
+    ui.textContent =
+      `Score: ${bee.score}` +
+      `\nSpoons: ${bee.spoons}/${TARGET_SPOONS}` +
+      `\nLives: ${bee.lives}` +
+      `\nDash CD: ${bee.dashCd.toFixed(1)}` +
+      `\nTime: ${m}:${s}`;
+  } else {
+    showEnd(state==='win' ? 'Buzz‑tastic! Wi‑Fi Restored!' : 'Connection Lost… Game Over');
+  }
+}
+
+function showEnd(msg){
+  ctx.fillStyle='rgba(0,0,0,0.7)';
+  ctx.fillRect(0,0,W,H);
+
+  ctx.fillStyle='#fff';
+  ctx.textAlign='center';
+  ctx.font='48px sans-serif';
+  ctx.fillText(msg, W/2, H/2);
+
+  const m = Math.floor(finalTime/60);
+  const s = String(Math.floor(finalTime%60)).padStart(2,'0');
+  ctx.fillStyle='yellow';
+  ctx.font='bold 72px Comic Sans MS, cursive';
+  ctx.fillText(`Time: ${m}:${s}`, W/2, H/2 + 80);
+
+  ui.style.display='none';
+}
+</script>
+</body>
+</html>
